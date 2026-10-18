@@ -38,6 +38,42 @@ static NSNumber *gActivePacksSize = nil;
 static CFAbsoluteTime gActivePacksLastStatCheck = 0.0;
 static NSMutableDictionary<NSString *, id> *gResolvedRendererPathCache = nil;
 
+static NSString *normalizedPackVersion(id version) {
+    NSArray *components = nil;
+    if ([version isKindOfClass:[NSArray class]]) {
+        components = (NSArray *)version;
+    } else if ([version isKindOfClass:[NSString class]]) {
+        components = [(NSString *)version componentsSeparatedByString:@"."];
+    }
+
+    if (components.count != 3) return nil;
+
+    NSMutableArray<NSString *> *normalizedComponents = [NSMutableArray arrayWithCapacity:3];
+    for (id component in components) {
+        NSString *value = nil;
+        if ([component isKindOfClass:[NSNumber class]]) {
+            value = [(NSNumber *)component stringValue];
+        } else if ([component isKindOfClass:[NSString class]]) {
+            value = [(NSString *)component stringByTrimmingCharactersInSet:
+                     [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        }
+        if (value.length == 0) return nil;
+
+        NSScanner *scanner = [NSScanner scannerWithString:value];
+        long long integerValue = 0;
+        if (![scanner scanLongLong:&integerValue] || !scanner.isAtEnd) return nil;
+        [normalizedComponents addObject:[NSString stringWithFormat:@"%lld", integerValue]];
+    }
+
+    return [normalizedComponents componentsJoinedByString:@"."];
+}
+
+static NSString *packCacheKey(NSString *packId, id version) {
+    NSString *normalizedVersion = normalizedPackVersion(version);
+    if (![packId isKindOfClass:[NSString class]] || packId.length == 0 || !normalizedVersion) return nil;
+    return [NSString stringWithFormat:@"%@|%@", packId, normalizedVersion];
+}
+
 // data path
 static NSString* getResourcePacksPath(void) {
     NSString *docPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
@@ -293,23 +329,24 @@ static void buildPackRootCache(void) {
             }
 
             NSString *uuid = manifest[@"header"][@"uuid"];
+            id headerVersion = manifest[@"header"][@"version"];
+            NSString *headerCacheKey = packCacheKey(uuid, headerVersion);
 
-            if (uuid) {
-                cache[uuid] = fullPath;
-
+            if (headerCacheKey) {
+                cache[headerCacheKey] = fullPath;
                 if (hasRenderer) {
-                    [rendererIds addObject:uuid];
+                    [rendererIds addObject:headerCacheKey];
                 }
             }
 
             for (NSDictionary *mod in manifest[@"modules"]) {
                 NSString *modUuid = mod[@"uuid"];
+                NSString *moduleCacheKey = packCacheKey(modUuid, mod[@"version"]);
 
-                if (modUuid) {
-                    cache[modUuid] = fullPath;
-
+                if (moduleCacheKey) {
+                    cache[moduleCacheKey] = fullPath;
                     if (hasRenderer) {
-                        [rendererIds addObject:modUuid];
+                        [rendererIds addObject:moduleCacheKey];
                     }
                 }
             }
@@ -330,7 +367,10 @@ static void buildPackRootCache(void) {
     HLog(@"[%s] Cache built: %lu ids (%lu with renderer)", HL_NAME, (unsigned long)cache.count, (unsigned long)rendererIds.count);
 }
 
-static NSString* findPackRoot(NSString* packId) {
+static NSString* findPackRoot(NSString* packId, id version) {
+    NSString *versionedKey = packCacheKey(packId, version);
+    if (!versionedKey) return nil;
+
     __block NSDictionary *cacheSnap = nil;
     if (gPackCacheQueue) {
         dispatch_sync(gPackCacheQueue, ^{
@@ -340,7 +380,7 @@ static NSString* findPackRoot(NSString* packId) {
         cacheSnap = packRootCache;
     }
 
-    NSString *cached = cacheSnap[packId];
+    NSString *cached = cacheSnap[versionedKey];
     
     if (!cached) {
         // Avoid blocking the caller (fopen hot-path). Schedule a rebuild once.
@@ -390,15 +430,18 @@ static NSString* findFileInPack(NSString* packId, NSString* subpack, NSString* r
     
     for (NSDictionary *pack in activePacks) {
         NSString *pid = packId ?: pack[@"pack_id"];
+        id version = pack[@"version"];
         NSString *sp = subpack ?: pack[@"subpack"] ?: @"default";
         if (!pid) continue;
 
         // If we have a renderer-only index, skip packs that can't override renderer files.
-        if (rendererIdsSnap && ![rendererIdsSnap containsObject:pid]) {
+        NSString *versionedKey = packCacheKey(pid, version);
+        if (!versionedKey) continue;
+        if (rendererIdsSnap && ![rendererIdsSnap containsObject:versionedKey]) {
             continue;
         }
         
-        NSString *packRoot = findPackRoot(pid);
+        NSString *packRoot = findPackRoot(pid, version);
         if (!packRoot) continue;
         
         // archive pack (zip or mcpack)
